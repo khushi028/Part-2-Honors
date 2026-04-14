@@ -1,0 +1,126 @@
+{
+  "title": "TADR System Dashboard",
+  "uid": "tadr-main",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "type": "stat", "title": "Active VMs",
+      "targets": [{ "expr": "tadr_vm_count", "legendFormat": "VMs" }],
+      "options": { "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [
+          { "value": 0, "color": "green" },
+          { "value": 4, "color": "yellow" },
+          { "value": 8, "color": "red" }
+        ]}}}
+    },
+    {
+      "id": 2, "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "type": "stat", "title": "Task Queue Depth",
+      "targets": [{ "expr": "tadr_task_queue_depth", "legendFormat": "Tasks" }],
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [
+          { "value": 0,  "color": "green" },
+          { "value": 10, "color": "yellow" },
+          { "value": 25, "color": "red" }
+        ]}}}
+    },
+    {
+      "id": 3, "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "type": "stat", "title": "Max VM Temperature (°C)",
+      "targets": [{ "expr": "max(tadr_vm_temperature)", "legendFormat": "Max Temp" }],
+      "fieldConfig": { "defaults": { "unit": "celsius", "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [
+          { "value": 0,  "color": "blue" },
+          { "value": 65, "color": "green" },
+          { "value": 75, "color": "yellow" },
+          { "value": 80, "color": "red" }
+        ]}}}
+    },
+    {
+      "id": 4, "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "type": "stat", "title": "Min Confidence",
+      "targets": [{ "expr": "min(tadr_vm_confidence)", "legendFormat": "Min Conf" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit",
+        "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [
+          { "value": 0,    "color": "red" },
+          { "value": 0.60, "color": "yellow" },
+          { "value": 0.80, "color": "green" }
+        ]}}}
+    },
+    {
+      "id": 5, "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "type": "timeseries", "title": "VM Temperatures — Current vs Predicted",
+      "targets": [
+        { "expr": "tadr_vm_temperature",      "legendFormat": "current {{vm_id}}" },
+        { "expr": "tadr_vm_pred_temperature", "legendFormat": "predicted {{vm_id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "celsius",
+        "custom": { "lineWidth": 2, "fillOpacity": 8 },
+        "thresholds": { "steps": [
+          { "value": 80, "color": "red" }
+        ]}},
+        "overrides": [{ "matcher": { "id": "byNamePattern", "options": "predicted" },
+          "properties": [{ "id": "custom.lineStyle", "value": { "dash": [8, 4] }}]}]
+      }
+    },
+    {
+      "id": 6, "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "type": "timeseries", "title": "CPU & GPU Usage per VM",
+      "targets": [
+        { "expr": "tadr_vm_cpu_percent", "legendFormat": "CPU {{vm_id}}" },
+        { "expr": "tadr_vm_gpu_percent", "legendFormat": "GPU {{vm_id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent",
+        "custom": { "lineWidth": 2 }}}
+    },
+    {
+      "id": 7, "gridPos": { "x": 0, "y": 12, "w": 12, "h": 7 },
+      "type": "timeseries", "title": "Thermal Velocity (°C / min) per VM",
+      "targets": [
+        { "expr": "tadr_vm_velocity", "legendFormat": "velocity {{vm_id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "celsius",
+        "custom": { "lineWidth": 2, "fillOpacity": 15 },
+        "thresholds": { "steps": [
+          { "value": 0.5, "color": "yellow" },
+          { "value": 1.2, "color": "red" }
+        ]}}},
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list" }
+      }
+    },
+    {
+      "id": 8, "gridPos": { "x": 12, "y": 12, "w": 12, "h": 7 },
+      "type": "timeseries", "title": "Prediction Confidence per VM",
+      "targets": [
+        { "expr": "tadr_vm_confidence", "legendFormat": "conf {{vm_id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1,
+        "custom": { "lineWidth": 2 },
+        "thresholds": { "steps": [
+          { "value": 0,    "color": "red" },
+          { "value": 0.60, "color": "yellow" },
+          { "value": 0.80, "color": "green" }
+        ]}}}
+    },
+    {
+      "id": 9, "gridPos": { "x": 0, "y": 19, "w": 24, "h": 6 },
+      "type": "timeseries", "title": "Task Queue Depth Over Time",
+      "targets": [
+        { "expr": "tadr_task_queue_depth", "legendFormat": "pending tasks" }
+      ],
+      "fieldConfig": { "defaults": {
+        "custom": { "lineWidth": 2, "fillOpacity": 20 },
+        "color": { "fixedColor": "purple", "mode": "fixed" }
+      }}
+    }
+  ]
+}
