@@ -1,0 +1,704 @@
+================================================================================
+  TADR SYSTEM — TEMPERATURE-AWARE DYNAMIC RESOURCE MANAGER
+  IN-DEPTH IMPLEMENTATION AND RESEARCH DOCUMENT
+================================================================================
+
+--------------------------------------------------------------------------------
+SECTION 1 — PROBLEM STATEMENT AND MOTIVATION
+--------------------------------------------------------------------------------
+
+Modern compute clusters, particularly those serving academic and research
+workloads, exhibit sharp, unpredictable spikes in CPU and GPU utilisation.
+These spikes cause sustained thermal elevation that, if unmanaged, leads to
+thermal throttling, hardware degradation, and silent performance loss.
+
+Reactive systems — those that act only after a threshold is already crossed —
+are fundamentally too slow. By the time a VM reports CPU temperature of 82°C,
+the thermal damage window has already opened. The cooling lag in real hardware
+(thermal inertia modelled as alpha = 0.15 in this system) means temperature
+continues rising for several minutes even after load is removed.
+
+TADR addresses this with a predictive control loop: predict where temperature
+will be 30 minutes from now, measure how fast it is approaching danger, and
+act before the threshold is hit — redistributing tasks if capacity exists,
+scaling out if the entire fleet is converging on danger simultaneously.
+
+
+--------------------------------------------------------------------------------
+SECTION 2 — DATASET: WHAT IT IS AND WHY IT IS STRUCTURED THIS WAY
+--------------------------------------------------------------------------------
+
+The training dataset covers March 1 to December 31, 2021 at 1-minute intervals,
+producing 440,640 rows. This is not arbitrary — 1-minute granularity is the
+finest resolution at which meaningful thermal trends manifest. Sub-minute
+intervals would add noise without predictive value; coarser intervals (5-minute)
+would smooth out the rapid onset bursts that the system is specifically designed
+to catch.
+
+Each row contains 15 columns across four groups:
+
+  CLIMATIC FACTORS
+    Ambient Temperature (°C)     — Bangalore seasonal pattern: 20°C Dec,
+                                   29°C April peak, 24°C monsoon months.
+                                   Diurnal swing modelled as sinusoidal with
+                                   monthly amplitude variation (4–7°C range).
+    Humidity (%)                 — Inversely correlated with ambient temp.
+                                   Monsoon months (Jun–Sep): 72–82%.
+                                   Dry season (Mar–May, Dec): 38–48%.
+    AQI (Air Quality Index)      — Traffic-correlated peaks at 08–10h and
+                                   17–20h. Monsoon rain suppresses particulates.
+                                   Range: 45–120.
+
+  ELECTRICAL PARAMETERS
+    Voltage (V), Current (A), Power (W), Frequency (Hz),
+    Active Energy (kWh), Power Factor
+    These reflect real power draw behaviour: voltage sags slightly under
+    heavy load, current rises with combined CPU+GPU load, power factor
+    drops marginally at high load. Active Energy resets per day with a
+    realistic 81.9 kWh base offset.
+
+  COMPUTE METRICS
+    CPU consumption (%)          — Load follows dual-peak diurnal pattern.
+                                   Academic spike days push this to 99%.
+    CPU Temperature (°C)         — Physics-based: base 42°C + load×0.36
+                                   + nonlinear term (load/100)²×12 +
+                                   ambient contribution. Crosses 80°C on
+                                   academic exam and submission days.
+    GPU consumption (%)          — Correlated with CPU (×0.72) with
+                                   independent burst events for rendering
+                                   and simulation jobs.
+    GPU Temperature (°C)         — Higher baseline (48°C idle), steeper
+                                   load curve (load×0.38). Designed to enter
+                                   the 80–85°C band under sustained load.
+
+  CALENDAR STRUCTURE
+    The dataset embeds five academic event periods (mid-sem exams Apr 19–28,
+    end-sem Jun 7–18, internals Aug 16–20, mid-sem Oct 11–20, end-sem+
+    projects Dec 1–15) and six vacation blocks where load drops to 25% of
+    normal. This gives the model real exposure to the full dynamic range:
+    idle/vacation behaviour, normal operation, and sustained spike events —
+    all essential for a model that needs to generalise across operational
+    contexts, not just average conditions.
+
+The time-ordered 85/15 train-test split (shuffle=False) is deliberate.
+Shuffling would allow the model to see "future" rows during training, producing
+optimistic evaluation metrics that collapse in production. Time-ordered splitting
+forces the model to be evaluated strictly on the chronological tail of the data —
+the closest analogue to real deployment conditions.
+
+
+--------------------------------------------------------------------------------
+SECTION 3 — FEATURE ENGINEERING
+--------------------------------------------------------------------------------
+
+Ten features are constructed for each training sample:
+
+  1.  CPU consumption (%)
+        Direct predictor of heat generation. The single strongest feature
+        because thermal output scales with computational load.
+
+  2.  GPU consumption (%)
+        Independent heat source. GPU-heavy workloads (ML training, video
+        rendering) raise chassis temperature independently of CPU load.
+
+  3.  CPU Temperature (°C)  — current
+        The most informative single feature for predicting near-term
+        temperature. The current value anchors the prediction.
+
+  4.  GPU Temperature (°C)  — current
+        Captures GPU thermal state independently. In GPU-dominated workloads
+        this becomes the primary heat source.
+
+  5.  prev_cpu_temp
+        Temperature at the immediately prior minute. Together with (3),
+        this gives the model the first derivative of temperature: whether
+        the system is heating or cooling at the moment of prediction.
+
+  6.  prev_gpu_temp
+        Same purpose for GPU thermal trajectory.
+
+  7.  delta_cpu_temp  =  CPU_temp[t] − CPU_temp[t−1]
+        Explicit first-order difference. Positive delta signals active
+        heating; negative signals cooling trend. This is redundant with
+        (3) and (5) algebraically, but RandomForest decision trees do not
+        compute differences internally — providing it explicitly improves
+        splits at boundary conditions.
+
+  8.  delta_gpu_temp
+        Same for GPU.
+
+  9.  hour_sin  =  sin(2π × hour / 24)
+  10. hour_cos  =  cos(2π × hour / 24)
+        Cyclic encoding of the time of day. A single raw "hour" integer
+        treats 23 and 0 as distant (difference = 23) when they are actually
+        adjacent (difference = 1). Sine-cosine encoding maps every hour to
+        a point on the unit circle, preserving cyclical continuity. This
+        lets the model learn that midnight behaviour is similar to 11 PM,
+        and that peak load at 10h and 15h should elicit similar thermal
+        responses — without needing separate training examples for every
+        hour combination.
+
+The target for both models is temperature HORIZON minutes (30 rows) ahead,
+constructed via pandas shift(-30). This makes every training sample a
+supervised regression problem: given the current state of a VM, predict
+where its temperature will be in 30 minutes.
+
+
+--------------------------------------------------------------------------------
+SECTION 4 — MODEL ARCHITECTURE: RANDOMFORESTREGRESSOR
+--------------------------------------------------------------------------------
+
+Two separate models are trained: one for CPU temperature, one for GPU
+temperature. They share the same architecture and feature space but are
+trained against independent targets.
+
+  Architecture:
+    RandomForestRegressor(
+        n_estimators   = 100,
+        max_depth      = 12,
+        min_samples_leaf = 5,
+        n_jobs         = -1,
+        random_state   = 42
+    )
+
+WHY RANDOMFOREST:
+
+  1. Non-parametric. It makes no assumption about the functional form of
+     the temperature-load relationship. The actual relationship is nonlinear
+     (thermal physics follows exponential approach to steady-state, not linear
+     growth), and RandomForest captures this without explicit polynomial
+     feature expansion.
+
+  2. Ensemble variance is meaningful. The 100 trees each see a bootstrap
+     sample of the data and a random subset of features. Their predictions
+     disagree in proportion to how ambiguous the input region is. This
+     disagreement is exploited directly to compute confidence (see Section 5).
+     A single regression tree or a linear model cannot produce this signal.
+
+  3. No normalisation required. Decision tree splits are threshold-based,
+     not distance-based. Features do not need to be on the same scale.
+     CPU% (0–100) and hour_sin (−1 to +1) can coexist without distorting
+     the model.
+
+  4. Robust to the irregular spike structure in the data. During exam
+     periods, load patterns deviate sharply from baseline. The bagging in
+     RandomForest (each tree trained on a bootstrap resample) naturally
+     downweights the influence of any single spike event, producing models
+     that generalise rather than memorise individual bursts.
+
+  max_depth = 12 is a deliberate regularisation choice. Deeper trees would
+  perfectly fit the training set but would be extremely sensitive to the
+  exact trajectory of each individual spike. At depth 12, trees capture the
+  dominant patterns (load → temp, diurnal cycle, thermal inertia) without
+  overfitting to the specific academic calendar of 2021.
+
+  min_samples_leaf = 5 ensures that no leaf node is based on fewer than 5
+  training examples. This prevents the tree from making confident predictions
+  about rare spike configurations seen only once or twice in training.
+
+
+--------------------------------------------------------------------------------
+SECTION 5 — INFERENCE: CONFIDENCE AND VELOCITY
+--------------------------------------------------------------------------------
+
+At runtime, every Kafka tick causes predictor.predict(vm) to be called for
+every registered VM. Here is exactly what happens:
+
+STEP 1 — Feature construction
+
+  _build_features(vm) assembles a (1 × 10) numpy array:
+    [cpu, gpu, temp, prev_temp, delta_temp, hour_sin, hour_cos]
+  Note: at inference time only 7 features are available (not 10), because
+  prev_gpu and delta_gpu require historical GPU temperature which the live
+  metric stream may not always carry. The training feature set uses 10 columns;
+  the inference vector must match exactly what train_models.py built.
+  This is a known implementation coupling — the feature column list in
+  train_models.py and _build_features() must be kept in sync.
+
+STEP 2 — Ensemble prediction
+
+  _ensemble_predict(model, X) iterates over model.estimators_ (the list of
+  100 trained decision trees) and collects each tree's prediction:
+
+    tree_preds = [tree.predict(X)[0] for tree in model.estimators_]
+    μ = mean(tree_preds)
+    σ = std(tree_preds)
+
+  This produces the ensemble mean prediction and the ensemble standard
+  deviation. The mean is the actual temperature forecast. The standard
+  deviation is the uncertainty estimate.
+
+  Why does σ measure uncertainty? Each tree was trained on a different
+  bootstrap sample of the training data and makes splits on a different
+  random subset of features. When trees agree (small σ), it means that
+  regardless of which subset of data or features is used, the predicted
+  temperature is similar — the mapping is robust and consistent. When trees
+  disagree (large σ), it means the input region is one where different
+  subsets of training data point to different conclusions — the prediction
+  is inherently less reliable.
+
+  This is the connection to probabilistic forecasting. If we treat the
+  ensemble as approximating p(y | x) ~ N(μ, σ²), then:
+    — High σ means a wider posterior distribution over future temperature
+    — Low σ means the posterior is tight around μ
+
+STEP 3 — Confidence mapping
+
+  confidence = 1 / (1 + σ)
+
+  This is a heuristic inverse-uncertainty mapping. It maps σ ∈ [0, ∞)
+  monotonically to confidence ∈ (0, 1]:
+
+    σ = 0.0  →  confidence = 1.000  (perfect agreement, act immediately)
+    σ = 0.5  →  confidence = 0.667
+    σ = 1.0  →  confidence = 0.500  (moderate uncertainty)
+    σ = 2.0  →  confidence = 0.333
+    σ = 4.0  →  confidence = 0.200  (high uncertainty, do not act)
+    σ = 9.0  →  confidence = 0.100
+
+  The decision engine requires confidence >= 0.60 to act on a prediction.
+  This corresponds to σ <= 0.667°C of ensemble disagreement. The threshold
+  is intentionally permissive enough to act on moderate certainty while
+  blocking action when the model is highly unsure.
+
+  The function is monotone, differentiable, and has the correct asymptotic
+  behaviour: it approaches 0 as σ → ∞ (total uncertainty → no confidence)
+  and approaches 1 as σ → 0 (perfect certainty → maximum confidence). No
+  other information is needed to justify its use beyond this.
+
+STEP 4 — Combined temperature prediction
+
+  pred_temp = cpu_pred × 0.6 + gpu_pred × 0.4
+
+  CPU is weighted higher (0.6) because in the dataset's operational context
+  (academic compute cluster), CPU load is the primary driver of chassis
+  temperature. GPU load is significant but secondary. The 60/40 split reflects
+  the empirical weight of CPU vs GPU in the thermal model used to generate
+  training data (see simulator.py: load_avg = cpu×0.6 + gpu×0.4).
+
+  combined_std = max(cpu_std, gpu_std)
+
+  Conservative: we take the worst-case uncertainty across both models. If
+  either model is uncertain, the combined confidence drops. This prevents
+  overconfident decisions in the regime where one model is well-calibrated
+  but the other is not.
+
+STEP 5 — Velocity computation
+
+  velocity = (pred_temp − current_temp) / PREDICTION_HORIZON
+
+  Units: °C per minute.
+
+  This is the estimated mean thermal slope over the next 30 minutes. It
+  answers the question: "If this prediction is correct, how fast is this
+  VM heating up on average?" A velocity of 0.5 °C/min means the VM will
+  be 15°C hotter in 30 minutes. A velocity of 1.2 °C/min means it will
+  be 36°C hotter.
+
+  This is not the instantaneous derivative (which would require two consecutive
+  predictions). It is the secant slope from current to predicted state. This
+  is valid and preferable in a control context because it describes the average
+  rate of approach to danger, which is what the scheduler and scaler need to
+  know — not the momentary fluctuation.
+
+  Velocity can be negative: the VM is predicted to cool down. The controller
+  ignores negative-velocity VMs for scheduling/scaling purposes.
+
+
+--------------------------------------------------------------------------------
+SECTION 6 — DECISION ENGINE: HOW VELOCITY AND CONFIDENCE DRIVE ACTIONS
+--------------------------------------------------------------------------------
+
+decision.py evaluates the entire fleet on every Kafka tick and returns exactly
+one of three strings: "SCHEDULE", "SCALE_OUT", or "IDLE".
+
+VM SCORING (used by both decision and scheduler)
+
+  score = cpu × 0.3 + pred_temp × 0.4 + confidence × velocity × 10
+
+  This composite score quantifies how "dangerous" a VM is as a task recipient:
+    — cpu × 0.3:              current load contribution
+    — pred_temp × 0.4:        predicted future heat (dominant term)
+    — conf × velocity × 10:   confidence-weighted thermal trend
+
+  The third term is critical: a VM with velocity = 2.0°C/min and confidence
+  = 0.9 contributes 18 points to the score. The same velocity with confidence
+  = 0.3 contributes only 6 points. This means the controller will not
+  aggressively avoid a VM just because one uncertain tree predicted high
+  temperature — the evidence must be consistent across the ensemble.
+
+  Lower score = better candidate for receiving new tasks.
+  Higher score = VM to move tasks away from.
+
+AT-RISK CLASSIFICATION
+
+  A VM is at-risk if ALL THREE conditions hold simultaneously:
+
+  1. pred_temp > 80°C  OR  current temp > 80°C
+       The prediction OR the observed value crosses threshold.
+       Using OR means the system acts on either leading or concurrent evidence.
+
+  2. confidence >= 0.60
+       The prediction must be trustworthy. If σ is high (trees disagree),
+       the at-risk classification is suppressed — the system waits for more
+       consistent evidence rather than acting on noise.
+
+  3. velocity >= 0.5°C/min
+       The temperature must be rising. A VM at 82°C with velocity = −0.2
+       (cooling down) should not trigger task migration — it is self-recovering.
+       Only VMs that are both hot and still heating are classified at-risk.
+
+SCHEDULE vs SCALE_OUT DECISION
+
+  SCALE_OUT is chosen when:
+    — at-risk fraction >= 0.5  (majority of fleet is endangered)
+    — max_velocity across at-risk VMs >= 1.2°C/min (fast thermal rise)
+    — no cool VMs exist (nowhere to redistribute tasks)
+
+  SCHEDULE is chosen when:
+    — at least one VM is at-risk
+    — at least one cool VM exists (cpu < 85% AND pred_temp <= 80°C)
+
+  IDLE is chosen when no VM meets the at-risk criteria.
+
+  A 60-second cooldown in main.py (SCALE_COOLDOWN = 60) suppresses consecutive
+  SCALE_OUT actions. After launching a new VM, the fleet needs time to absorb
+  its metrics and re-evaluate. Without this guard, a single prolonged thermal
+  event would trigger cascading scale-outs on every Kafka tick.
+
+THE SCORE'S ROLE IN SCHEDULING
+
+  After decision() returns "SCHEDULE", schedule() uses the score field that
+  decision() wrote onto each VM dict. This avoids re-computing score in the
+  scheduler — the decision pass already annotated every VM.
+
+
+--------------------------------------------------------------------------------
+SECTION 7 — SCHEDULER: HOW TASK ASSIGNMENT WORKS
+--------------------------------------------------------------------------------
+
+schedule(tasks, vms) in controller/scheduler.py implements a greedy
+best-fit assignment with priority ordering.
+
+PRIORITY SORT
+
+  Tasks are sorted by priority before assignment:
+    high → normal → low    (mapped to 0, 1, 2)
+
+  High-priority tasks get the first pick of available cool VMs. Low-priority
+  tasks are assigned last and are most likely to be deferred if capacity
+  runs out. This implements a basic preemptive-priority model without
+  requiring preemption of running tasks — it operates at the boundary of
+  queue consumption.
+
+VM ELIGIBILITY FILTER
+
+  Only VMs satisfying BOTH of the following receive tasks:
+    pred_temp <= 80°C        (model does not predict overheating)
+    cpu < 85%                (CPU headroom exists for the task's cpu_req)
+
+  VMs that are hot but have the prediction trusted (at-risk VMs) are
+  completely excluded. The scheduler never assigns to a VM the decision
+  engine has identified as endangered.
+
+FIRST-FIT ASSIGNMENT
+
+  For each task:
+    Iterate through eligible VMs sorted by score ascending (coolest first).
+    Assign to the first VM where:
+      current_cpu + task.cpu_req < CPU_CAPACITY_MAX (85%)
+
+    On assignment:
+      vm["cpu"]  += task["cpu_req"]
+      vm["gpu"]  += task["gpu_req"] × 0.5   (GPU is shared, conservatively halved)
+
+  The cpu field is updated in-memory immediately. This means subsequent
+  tasks in the same scheduling round see the updated load — the scheduler
+  is stateful within a round. This prevents the pathological case of all
+  tasks being assigned to a single "coolest" VM simply because it had the
+  lowest score at the start of the round.
+
+UNASSIGNED TASKS
+
+  Tasks that cannot fit in any eligible VM are returned in a list and placed
+  back at the front of tasks[] in main.py. They will be re-attempted on the
+  next scheduling tick (typically seconds later). This creates a natural
+  backpressure mechanism: growing queue depth signals to operators (via the
+  Grafana panel) that the fleet is undersized for the workload.
+
+
+--------------------------------------------------------------------------------
+SECTION 8 — SCALER: LOCAL SIMULATION AND AWS EC2
+--------------------------------------------------------------------------------
+
+scaler.py implements two paths, selectable via environment variable:
+
+LOCAL PATH (_local_scale_out)
+
+  Adds a new entry directly to the vms dict:
+    {
+      "vm_id":     "vm-N",
+      "cpu":       15.0,
+      "gpu":       10.0,
+      "temp":      42.0,
+      "prev_temp": 42.0,
+    }
+
+  The new VM starts at realistic idle values. On the next scheduling round,
+  it will have the lowest score in the fleet and will absorb the most tasks.
+  This is the intended behaviour — new VMs immediately become the primary
+  targets for task redistribution.
+
+AWS PATH (_aws_scale_out)
+
+  Uses boto3.client("ec2").run_instances() with:
+    — A pre-configured AMI (Amazon Linux 2, us-east-1)
+    — Instance type t3.medium (2 vCPU, 4 GB RAM — adequate for the worker)
+    — IAM instance profile tadr-ec2-role (requires ec2:RunInstances)
+    — UserData bootstrap script that:
+        yum install python3 git
+        pip3 install kafka-python numpy
+        git clone <repo>
+        nohup python3 worker/producer.py --vm-id <new-vm-id> &
+
+  The new VM is pre-registered in vms[] with idle values immediately upon
+  boto3 call return (before the instance has booted). This prevents the
+  60-second boot window from delaying the next scheduling round. Once the
+  instance boots and the worker producer starts sending real metrics, the
+  pre-registered idle values are overwritten by live data.
+
+  scale_in() is also implemented: it selects the VM with the lowest cpu load
+  and terminates it via ec2.terminate_instances(). This is called manually
+  or could be triggered by a separate idle-detection policy.
+
+
+--------------------------------------------------------------------------------
+SECTION 9 — KAFKA: WHY IT IS USED AS BOTH STREAM AND QUEUE
+--------------------------------------------------------------------------------
+
+The system uses two Kafka topics with fundamentally different semantic roles:
+
+vm-metrics (stream)
+  Published by each worker every 5 seconds (EMIT_INTERVAL_SEC = 5).
+  Consumer group offset is set to "latest" — the controller only cares about
+  the most recent state of each VM, not historical messages. If the controller
+  restarts, it picks up current state immediately without replaying hours of
+  historical metrics.
+
+  Each message overwrites the previous state for that vm_id in the vms dict.
+  The topic behaves as a compacted state log.
+
+task-queue (queue)
+  Published by the task producer at variable intervals (2–5 seconds).
+  Messages accumulate. The controller reads them and attempts assignment;
+  unassigned tasks are returned to the in-memory tasks list (not re-published
+  to Kafka). This is a deliberate simplification: in production, unassigned
+  tasks should be re-committed to Kafka with an incremented retry count to
+  survive controller restarts.
+
+  Partitions: 3 for each topic.
+  Replication factor: 1 (local demo; production should use 3).
+
+The single consumer reading both topics (KafkaConsumer with two topic names)
+uses a round-robin poll across partitions. This means the processing rate is
+proportional to the combined arrival rate of both topics. Under heavy task
+load with few VM updates, the controller will process mostly task messages;
+under heavy VM churn the reverse occurs. The prediction and decision logic
+runs on every consumed message regardless of topic — this ensures predictions
+are refreshed on both task arrivals and metric updates.
+
+
+--------------------------------------------------------------------------------
+SECTION 10 — MONITORING: PROMETHEUS AND GRAFANA
+--------------------------------------------------------------------------------
+
+exporter.py exposes eight gauge metrics at port 8000:
+
+  tadr_vm_cpu_percent {vm_id}       — live CPU load per VM
+  tadr_vm_gpu_percent {vm_id}       — live GPU load per VM
+  tadr_vm_temperature {vm_id}       — current temperature per VM
+  tadr_vm_pred_temperature {vm_id}  — predicted temperature at t+30 per VM
+  tadr_vm_confidence {vm_id}        — ensemble confidence per VM
+  tadr_vm_velocity {vm_id}          — thermal velocity in °C/min per VM
+  tadr_task_queue_depth             — total pending tasks
+  tadr_vm_count                     — total registered VMs
+
+The pred_temperature gauge is the most operationally useful. Seeing the
+predicted line (rendered as a dashed overlay in grafana.json) diverge upward
+from the current temperature line gives operators 30 minutes of warning before
+a thermal event occurs. This is the system working as intended.
+
+The velocity panels include threshold annotations at 0.5 (schedule trigger)
+and 1.2 (scale trigger). When the velocity line crosses these thresholds on
+a VM with high confidence, the corresponding action in the controller loop
+has already fired — but the Grafana panel confirms it visually.
+
+The confidence panel shows the health of the prediction itself. Low confidence
+on all VMs simultaneously indicates a regime the model has not seen before
+(an unusual load pattern, hardware change, or ambient temperature outside
+training distribution). This is an operational signal to review whether the
+models need retraining.
+
+
+--------------------------------------------------------------------------------
+SECTION 11 — END-TO-END FLOW: ONE COMPLETE TICK
+--------------------------------------------------------------------------------
+
+This describes exactly what happens from the moment a worker emits a metric
+to the moment Prometheus is updated.
+
+  T=0   VMSimulator.tick() runs on vm-2:
+          burst event fires (1% probability hit)
+          burst_cpu = 48.3, burst_ttl = 27
+          raw_cpu = 62.1 (diurnal base) + 48.3 (burst) + gauss noise = 110.8
+          → clamped to 99.0
+          cpu  = prev_cpu × 0.7 + raw_cpu × 0.3 = 38.0 × 0.7 + 99.0 × 0.3 = 56.3
+          temp = 45.2 + 0.15 × (25 + 56.3×0.45 + 0.326 - 45.2) = 47.9°C
+          Emits: {vm_id: "vm-2", cpu: 56.3, gpu: 38.1, temp: 47.9}
+
+  T=0+ε  KafkaProducer.send("vm-metrics", payload)
+
+  T=~0   Controller consumer receives the message:
+          topic = "vm-metrics"
+          prev_temp = vms["vm-2"]["temp"] = 45.2   (stored from last tick)
+          vms["vm-2"] updated with new data + prev_temp = 45.2
+
+  T=~0   predictor.predict(vms["vm-2"]) called:
+          X = [56.3, 38.1, 47.9, 45.2, 2.7, hour_sin, hour_cos]
+          cpu_model: 100 trees predict → μ = 71.4, σ = 1.2
+          gpu_model: 100 trees predict → μ = 64.8, σ = 0.9
+          pred_temp  = 71.4 × 0.6 + 64.8 × 0.4 = 68.76°C
+          combined_σ = max(1.2, 0.9) = 1.2
+          confidence = 1 / (1 + 1.2) = 0.455
+          velocity   = (68.76 - 47.9) / 30 = 0.695°C/min
+
+          → confidence = 0.455 < CONFIDENCE_MIN (0.60)
+          → vm-2 will NOT be classified as at-risk despite rising velocity
+          → decision: IDLE (confidence gate suppressed action)
+
+  T=~0   At the next tick, if load stays elevated:
+          cpu = 72.4, temp = 54.1, prev_temp = 47.9
+          trees now have more consistent evidence (the burst is sustained)
+          σ drops to 0.6 → confidence = 0.625 > 0.60
+          velocity = (81.3 - 54.1) / 30 = 0.907°C/min > VELOCITY_SCHEDULE
+          pred_temp = 81.3 > CPU_TEMP_THRESHOLD
+          → vm-2 is now at-risk
+          → decision checks if cool VMs exist → vm-1 (cpu: 32%) is eligible
+          → action = SCHEDULE
+
+  T=~0   scheduler.schedule(tasks, vms):
+          tasks sorted by priority: high-priority task t00042 (cpu_req=12) first
+          eligible VMs: [vm-1 (score=28.4), vm-3 (score=34.1)]
+          t00042 → vm-1: cpu 32% + 12 = 44% < 85% → assigned
+          t00031 → vm-1: cpu 44% + 8  = 52% < 85% → assigned
+          t00067 → vm-1: cpu 52% + 15 = 67% < 85% → assigned
+          t00012 → vm-1: cpu 67% + 18 = 85% = 85% → NOT assigned (boundary)
+          t00012 stays in remaining_tasks
+
+  T=~0   update_metrics(vms, tasks):
+          tadr_vm_cpu_percent{vm_id="vm-2"} = 72.4
+          tadr_vm_pred_temperature{vm_id="vm-2"} = 81.3
+          tadr_vm_confidence{vm_id="vm-2"} = 0.625
+          tadr_vm_velocity{vm_id="vm-2"} = 0.907
+          tadr_task_queue_depth = 1
+
+  T=+10s Prometheus scrapes port 8000.
+          Grafana renders updated panels.
+          Operator sees vm-2 predicted line crossing 80°C threshold.
+          Queue depth shows 1 pending task.
+
+
+--------------------------------------------------------------------------------
+SECTION 12 — DESIGN DECISIONS AND THEIR JUSTIFICATIONS
+--------------------------------------------------------------------------------
+
+WHY NOT PREDICT CPU LOAD AND DERIVE TEMPERATURE FROM IT
+
+  An alternative design would predict CPU% 30 minutes ahead, then apply the
+  thermal model to get predicted temperature. This two-stage approach has more
+  failure modes: errors in load prediction compound with errors in the thermal
+  model. Directly predicting temperature from a feature vector that includes
+  current temperature (the single strongest predictor) is more accurate and
+  simpler.
+
+WHY RandomForest OVER LSTM
+
+  LSTM is the common choice for time-series prediction and would likely achieve
+  lower MAE on this dataset. However:
+    — LSTM requires careful sequence length tuning and stateful management
+      across the streaming consumer loop
+    — LSTM does not naturally produce per-step ensemble variance for confidence
+    — LSTM training is sensitive to learning rate and batch size; RandomForest
+      is hyperparameter-robust
+  For a system where confidence estimation is architecturally required, ensemble
+  variance from RandomForest is a cleaner mechanism than MC Dropout or
+  conformal prediction wrappers on an LSTM.
+
+WHY VELOCITY IS (pred − current) / horizon AND NOT A RUNNING DERIVATIVE
+
+  A running derivative (temp[t] − temp[t−1]) / Δt captures instantaneous
+  noise. A brief 0.3°C measurement fluctuation produces a false spike in
+  instantaneous velocity. The prediction-based velocity averages over the
+  30-minute horizon, suppressing tick-level noise while capturing genuine
+  thermal trends. It is also more directly actionable: "this VM will heat
+  at 0.9°C/min on average over the next 30 minutes" is more useful than
+  "this VM heated 0.3°C in the last 5 seconds."
+
+WHY CONFIDENCE GATES ALL ACTIONS
+
+  Without the confidence gate, a period of unusual load (a pattern the model
+  saw rarely during training) would produce high-uncertainty predictions that
+  happen to cross the temperature threshold. The controller would schedule or
+  scale on unreliable evidence. The 0.60 confidence floor ensures that actions
+  are taken only when the ensemble has seen enough similar patterns in training
+  to make consistent predictions. When confidence is low on all VMs, the system
+  degrades gracefully to IDLE rather than thrashing.
+
+WHY THE SCORE FUNCTION WEIGHTS pred_temp AT 0.4
+
+  The score is used to rank VMs as task recipients. pred_temp (coefficient 0.4)
+  is the dominant term for hot-but-not-yet-at-threshold VMs. A VM with
+  current cpu = 40% (low) but pred_temp = 79°C (nearly hot) should not receive
+  tasks even though its current load is light. The pred_temp coefficient ensures
+  that the scheduler looks ahead, not just at the current state.
+
+
+--------------------------------------------------------------------------------
+SECTION 13 — LIMITATIONS AND FUTURE WORK
+--------------------------------------------------------------------------------
+
+1.  STATE IS IN-MEMORY ONLY
+    The vms dict and tasks list are lost on controller restart. A Redis or
+    DynamoDB state backend would provide durability. Unassigned tasks should
+    also be re-published to Kafka rather than held in-memory.
+
+2.  SINGLE KAFKA CONSUMER
+    The controller runs single-threaded. Under high message volume (many VMs
+    emitting at 5-second intervals), the consumer loop may fall behind. A
+    partition-parallelised consumer group with separate prediction and decision
+    threads would scale horizontally.
+
+3.  MODELS ARE STATIC AFTER TRAINING
+    The RandomForest models are trained once on 2021 data and serialised to
+    .pkl files. Hardware refresh, workload shifts, or data centre relocation
+    (different ambient temperature profile) would degrade prediction accuracy
+    without retraining. An online learning wrapper (incremental RandomForest
+    or a Hoeffding tree) would adapt to distribution shift automatically.
+
+4.  CONFIDENCE IS HEURISTIC
+    The 1/(1+σ) mapping is mathematically convenient but not calibrated.
+    A calibrated confidence score would require post-hoc isotonic regression
+    or Platt scaling against a held-out validation set, mapping raw σ values
+    to empirical error probabilities. This would allow the confidence threshold
+    (currently 0.60) to be interpreted as "act when the model is wrong less
+    than 40% of the time" rather than as an uncalibrated heuristic cutoff.
+
+5.  GPU TEMPERATURE THRESHOLD
+    The GPU threshold is set to 82.5°C (mid-point of the 80–85°C design band).
+    The current decision logic uses CPU_TEMP_THRESHOLD for both CPU and GPU
+    at-risk classification. A separate GPU threshold check would allow finer
+    GPU-specific scheduling when GPU temperature is the binding constraint.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
